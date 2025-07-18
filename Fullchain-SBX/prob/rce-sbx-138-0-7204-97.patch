@@ -1,0 +1,2042 @@
+diff --git a/build_overrides/partition_alloc.gni b/build_overrides/partition_alloc.gni
+index ae7040d2d2b95..de391e56845e2 100644
+--- a/build_overrides/partition_alloc.gni
++++ b/build_overrides/partition_alloc.gni
+@@ -117,7 +117,7 @@ use_partition_alloc_as_malloc_default =
+     use_allocator_shim_default && _is_partition_alloc_everywhere_platform &&
+     !_disable_partition_alloc_everywhere
+ 
+-enable_backup_ref_ptr_support_default = use_partition_alloc_as_malloc_default
++enable_backup_ref_ptr_support_default = false
+ 
+ enable_backup_ref_ptr_slow_checks_default = false
+ 
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index 6d414afa34803..6a126f10c0ce7 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -2506,6 +2506,13 @@ source_set("browser") {
+     "worker_host/worker_script_loader.h",
+     "worker_host/worker_script_loader_factory.cc",
+     "worker_host/worker_script_loader_factory.h",
++    "CFS/cfs_manager_impl.cc",
++    "CFS/cfs_manager_impl.h",
++    "CFS/cfs_file_impl.cc",
++    "CFS/cfs_file_impl.h",
++    "CFS/cfs_directory_impl.cc",
++    "CFS/cfs_directory_impl.h",
++    "CFS/cfs_item.h",
+   ]
+ 
+   if (is_android) {
+diff --git a/content/browser/CFS/cfs_directory_impl.cc b/content/browser/CFS/cfs_directory_impl.cc
+new file mode 100644
+index 0000000000000..e3485a5f07ada
+--- /dev/null
++++ b/content/browser/CFS/cfs_directory_impl.cc
+@@ -0,0 +1,317 @@
++// content/browser/CFS/cfs_directory_impl.cc
++
++#include "content/browser/CFS/cfs_directory_impl.h"
++
++#include "content/browser/CFS/cfs_file_impl.h"
++#include "content/browser/CFS/cfs_manager_impl.h"
++
++// Base
++#include "base/files/file_util.h"
++#include "base/logging.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++
++CodegateDirectoryImpl::CodegateDirectoryImpl(const std::string& path)
++    : CodegateItem(path, TYPE_DIRECTORY) {}
++
++CodegateDirectoryImpl::~CodegateDirectoryImpl() = default;
++
++void CodegateDirectoryImpl::GetItemHandle(const std::string& itemname,
++                                          GetItemHandleCallback callback) {
++  blink::mojom::cfs::ITEMTYPE item_type;
++
++  CodegateItem* item = FindItemByName(itemname);
++  if (!item) {
++    LOG(ERROR) << "Failed to find item: " << itemname;
++    item_type = blink::mojom::cfs::ITEMTYPE::kFailed;
++    std::move(callback).Run(item_type, nullptr);
++    return;
++  }
++
++  int filetype = item->GetItemType();
++  switch (filetype) {
++    case TYPE_FILE: {
++      item_type = blink::mojom::cfs::ITEMTYPE::kFile;
++      auto* file = static_cast<CodegateFileImpl*>(item);
++      auto remote_file = file->GenerateConnection();
++      blink::mojom::cfs::CodegateItemResponsePtr response =
++          blink::mojom::cfs::CodegateItemResponse::NewRemoteFile(
++              std::move(remote_file));
++      std::move(callback).Run(item_type, std::move(response));
++    } break;
++    case TYPE_DIRECTORY: {
++      item_type = blink::mojom::cfs::ITEMTYPE::kDir;
++      auto* dir = static_cast<CodegateDirectoryImpl*>(item);
++      auto remote_dir = dir->GenerateConnection();
++      blink::mojom::cfs::CodegateItemResponsePtr response =
++          blink::mojom::cfs::CodegateItemResponse::NewRemoteDir(
++              std::move(remote_dir));
++      std::move(callback).Run(item_type, std::move(response));
++    } break;
++    default:
++      item_type = blink::mojom::cfs::ITEMTYPE::kFailed;
++      std::move(callback).Run(item_type, nullptr);
++      break;
++  }
++}
++
++void CodegateDirectoryImpl::CreateItem(const std::string& itemname,
++                                       blink::mojom::cfs::ITEMTYPE type,
++                                       CreateItemCallback callback) {
++  blink::mojom::cfs::ITEMTYPE item_type;
++  switch (type) {
++    case blink::mojom::cfs::ITEMTYPE::kFile: {
++      auto new_file = std::make_unique<CodegateFileImpl>(itemname);
++      auto remote_file = new_file->GenerateConnection();
++      if (AddItemInternal(std::move(new_file))) {
++        item_type = blink::mojom::cfs::ITEMTYPE::kFile;
++
++        blink::mojom::cfs::CodegateItemResponsePtr response =
++            blink::mojom::cfs::CodegateItemResponse::NewRemoteFile(
++                std::move(remote_file));
++        std::move(callback).Run(item_type, std::move(response));
++      }
++    } break;
++
++    case blink::mojom::cfs::ITEMTYPE::kDir: {
++      auto new_directory = std::make_unique<CodegateDirectoryImpl>(itemname);
++      auto remote_dir = new_directory->GenerateConnection();
++      if (AddItemInternal(std::move(new_directory))) {
++        item_type = blink::mojom::cfs::ITEMTYPE::kDir;
++        blink::mojom::cfs::CodegateItemResponsePtr response =
++            blink::mojom::cfs::CodegateItemResponse::NewRemoteDir(
++                std::move(remote_dir));
++        std::move(callback).Run(item_type, std::move(response));
++      }
++    } break;
++
++    default:
++      item_type = blink::mojom::cfs::ITEMTYPE::kFailed;
++      LOG(ERROR) << "Failed to create item: " << itemname;
++      std::move(callback).Run(item_type,
++                              blink::mojom::cfs::CodegateItemResponsePtr());
++
++      break;
++  }
++}
++
++void CodegateDirectoryImpl::DeleteItem(const std::string& itemname,
++                                       DeleteItemCallback callback) {
++  std::unique_ptr<CodegateItem> removed_item = RemoveItemByName(itemname);
++  bool success = (removed_item != nullptr);
++
++  std::move(callback).Run(success);
++}
++
++void CodegateDirectoryImpl::RenameItem(const std::string& filename_orig,
++                                       const std::string& filename_new,
++                                       RenameItemCallback callback) {
++  if (!IsItemNameExists(filename_orig) && IsItemNameExists(filename_new)) {
++    std::move(callback).Run(false);
++    return;
++  }
++
++  CodegateItem* target_file = FindItemByName(filename_orig);
++  target_file->SetItemName(filename_new);
++
++  std::move(callback).Run(true);
++}
++
++void CodegateDirectoryImpl::ChangeItemLocation(
++    const std::string& filename_src,
++    const std::string& dst_dir,
++    ChangeItemLocationCallback callback) {
++  CodegateDirectoryImpl* destination_directory =
++      ValidateChangeLocation(filename_src, dst_dir);
++
++  if (!destination_directory) {
++    blink::mojom::cfs::ITEMTYPE item_type =
++        blink::mojom::cfs::ITEMTYPE::kFailed;
++    std::move(callback).Run(item_type,
++                            blink::mojom::cfs::CodegateItemResponsePtr());
++    return;
++  }
++
++  std::unique_ptr<CodegateItem> file_to_move = RemoveItemByName(filename_src);
++
++  struct backup backup_info;
++  backup_info.itemname = file_to_move->GetItemName();
++  backup_info.filetype = file_to_move->GetItemType();
++
++  if (!destination_directory->AddItemInternal(std::move(file_to_move))) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&CodegateDirectoryImpl::RecoverItem,
++                                  weak_factory_.GetWeakPtr(), backup_info,
++                                  destination_directory, std::move(callback)));
++    return;
++  }
++
++  blink::mojom::cfs::ITEMTYPE item_type = blink::mojom::cfs::ITEMTYPE::kFailed;
++  std::move(callback).Run(item_type,
++                          blink::mojom::cfs::CodegateItemResponsePtr());
++}
++
++void CodegateDirectoryImpl::ListItems(ListItemsCallback callback) {
++  std::vector<std::string> item_list = GetItemNameList();
++  std::move(callback).Run(item_list);
++}
++
++void CodegateDirectoryImpl::GetPwd(GetPwdCallback callback) {
++  std::string full_path;
++  CodegateDirectoryImpl* current_directory = this;
++
++  while (current_directory != nullptr) {
++    full_path = "/" + current_directory->GetItemName() + full_path;
++    current_directory = current_directory->GetParentDir();
++  }
++
++  std::move(callback).Run(full_path);
++}
++
++void CodegateDirectoryImpl::AddReceiver(
++    mojo::PendingReceiver<blink::mojom::cfs::CodegateDirectory> receiver) {
++  receivers_.Add(this, std::move(receiver));
++  receivers_.set_disconnect_handler(base::BindRepeating(
++      &CodegateDirectoryImpl::OnReceiverDisconnect, base::Unretained(this)));
++}
++
++mojo::PendingRemote<blink::mojom::cfs::CodegateDirectory>
++CodegateDirectoryImpl::GenerateConnection() {
++  mojo::PendingRemote<blink::mojom::cfs::CodegateDirectory> remote;
++  AddReceiver(remote.InitWithNewPipeAndPassReceiver());
++  return remote;
++}
++
++void CodegateDirectoryImpl::OnReceiverDisconnect() {
++  if (receivers_.current_receiver()) {
++    receivers_.Remove(receivers_.current_receiver());
++  }
++}
++// Private
++bool CodegateDirectoryImpl::AddItemInternal(
++    std::unique_ptr<CodegateItem> new_item) {
++  if (IsItemNameExists(new_item->GetItemName())) {
++    return false;
++  }
++
++  new_item->SetParentDir(this);
++  item_list_.push_back(std::move(new_item));
++  return true;
++}
++
++void CodegateDirectoryImpl::RecoverItem(
++    struct backup backup_info,
++    CodegateDirectoryImpl* destination_directory,
++    ChangeItemLocationCallback callback) {
++  blink::mojom::cfs::ITEMTYPE item_type;
++  blink::mojom::cfs::CodegateItemResponsePtr response;
++  std::unique_ptr<CodegateItem> recovered_file;
++
++  if (backup_info.filetype == TYPE_DIRECTORY) {
++    auto new_dir =
++        std::make_unique<CodegateDirectoryImpl>(backup_info.itemname + "_swp");
++    auto remote_dir = new_dir->GenerateConnection();
++    response = blink::mojom::cfs::CodegateItemResponse::NewRemoteDir(
++        std::move(remote_dir));
++    item_type = blink::mojom::cfs::ITEMTYPE::kDir;
++    recovered_file = std::move(new_dir);
++  } else {
++    auto new_file =
++        std::make_unique<CodegateFileImpl>(backup_info.itemname + ".swp");
++    auto remote_file = new_file->GenerateConnection();
++    response = blink::mojom::cfs::CodegateItemResponse::NewRemoteFile(
++        std::move(remote_file));
++    item_type = blink::mojom::cfs::ITEMTYPE::kFile;
++    recovered_file = std::move(new_file);
++  }
++
++  if (!destination_directory->AddItemInternal(std::move(recovered_file))) {
++    std::move(callback).Run(item_type,
++                            blink::mojom::cfs::CodegateItemResponsePtr());
++    LOG(ERROR) << "Failed to recover item: " << backup_info.itemname;
++    return;
++  }
++
++  std::move(callback).Run(item_type, std::move(response));
++}
++
++CodegateDirectoryImpl* CodegateDirectoryImpl::ValidateChangeLocation(
++    const std::string& itemname,
++    const std::string& dst_dir) {
++  if (!IsItemNameExists(itemname) || !IsItemNameExists(dst_dir)) {
++    return nullptr;
++  }
++
++  if(itemname == ".." || itemname == ".") {
++    return nullptr;
++  }
++  CodegateDirectoryImpl* dst = nullptr;
++  if (dst_dir == ".") {
++    dst = this;
++  } else if (dst_dir == "..") {
++    dst = GetParentDir();
++  } else if (IsValidDirectory(dst_dir)) {
++    dst = static_cast<CodegateDirectoryImpl*>(FindItemByName(dst_dir));
++  }
++
++  return dst;
++}
++
++CodegateItem* CodegateDirectoryImpl::FindItemByName(
++    const std::string& name) const {
++  if (name == "..") {
++    return static_cast<CodegateItem*>(GetParentDir());
++  }
++
++  auto it = std::find_if(
++      item_list_.begin(), item_list_.end(),
++      [&name](const auto& file) { return file->GetItemName() == name; });
++
++  return it != item_list_.end() ? it->get() : nullptr;
++}
++
++std::unique_ptr<CodegateItem> CodegateDirectoryImpl::RemoveItemByName(
++    const std::string& name) {
++  auto it = std::find_if(
++      item_list_.begin(), item_list_.end(),
++      [&name](const auto& file) { return file->GetItemName() == name; });
++
++  if (it != item_list_.end()) {
++    std::unique_ptr<CodegateItem> result = std::move(*it);
++    item_list_.erase(it);
++    return result;
++  }
++
++  return nullptr;
++}
++
++bool CodegateDirectoryImpl::IsItemNameExists(
++    const std::string& itemname) const {
++  return FindItemByName(itemname) != nullptr;
++}
++
++bool CodegateDirectoryImpl::IsValidFile(const std::string& itemname) const {
++  CodegateItem* target_file = FindItemByName(itemname);
++  return target_file != nullptr && target_file->GetItemType() == TYPE_FILE;
++}
++
++bool CodegateDirectoryImpl::IsValidDirectory(const std::string& dirname) const {
++  CodegateItem* target_dir = FindItemByName(dirname);
++  return target_dir != nullptr && target_dir->GetItemType() == TYPE_DIRECTORY;
++}
++
++std::vector<std::string> CodegateDirectoryImpl::GetItemNameList() const {
++  std::vector<std::string> result;
++  result.reserve(item_list_.size());
++
++  for (const auto& file : item_list_) {
++    if (file->GetItemType() == TYPE_DIRECTORY) {
++      result.push_back("/" + file->GetItemName());
++    } else {
++      result.push_back(file->GetItemName());
++    }
++  }
++
++  return result;
++}
+diff --git a/content/browser/CFS/cfs_directory_impl.h b/content/browser/CFS/cfs_directory_impl.h
+new file mode 100644
+index 0000000000000..e38ad6f48d33e
+--- /dev/null
++++ b/content/browser/CFS/cfs_directory_impl.h
+@@ -0,0 +1,98 @@
++#ifndef CONTENT_BROWSER_CFS_CFS_DIRECTORY_IMPL_H_
++#define CONTENT_BROWSER_CFS_CFS_DIRECTORY_IMPL_H_
++
++// library
++#include <cstdint>
++#include <list>
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++// content
++#include "content/browser/CFS/cfs_file_impl.h"
++#include "content/browser/CFS/cfs_item.h"
++#include "content/browser/CFS/cfs_manager_impl.h"
++
++// base
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++
++// mojo dependency
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++
++// mojo IPC Rule
++#include "third_party/blink/public/mojom/CFS/cfs.mojom.h"
++
++struct backup {
++  std::string itemname;
++  int filetype;
++};
++
++class CodegateFileImpl;
++
++class CodegateDirectoryImpl
++    : public blink::mojom::cfs::CodegateDirectory,
++      public CodegateItem {
++ public:
++  explicit CodegateDirectoryImpl(const std::string& path);
++  ~CodegateDirectoryImpl() override;
++
++  CodegateDirectoryImpl(const CodegateDirectoryImpl&) = delete;
++  CodegateDirectoryImpl& operator=(const CodegateDirectoryImpl&) = delete;
++
++  // Mojo IDL
++  void GetItemHandle(const std::string& itemname,
++                     GetItemHandleCallback callback) override;
++
++  void CreateItem(const std::string& itemname,
++                  blink::mojom::cfs::ITEMTYPE type,
++                  CreateItemCallback callback) override;
++
++  void DeleteItem(const std::string& itemname,
++                  DeleteItemCallback callback) override;
++
++  void RenameItem(const std::string& itemname_orig,
++                  const std::string& itemname_new,
++                  RenameItemCallback callback) override;
++
++  void ChangeItemLocation(const std::string& itemname_src,
++                          const std::string& itemname_dst,
++                          ChangeItemLocationCallback callback) override;
++
++  void ListItems(ListItemsCallback callback) override;
++
++  void GetPwd(GetPwdCallback callback) override;
++
++  void AddReceiver(mojo::PendingReceiver<blink::mojom::cfs::CodegateDirectory> receiver);
++  mojo::PendingRemote<blink::mojom::cfs::CodegateDirectory> GenerateConnection();
++    void OnReceiverDisconnect();
++
++
++
++ private:
++  bool AddItemInternal(std::unique_ptr<CodegateItem> new_item);
++  void RecoverItem(struct backup backup_info,
++                   CodegateDirectoryImpl* destination_directory,
++                   ChangeItemLocationCallback callback);
++
++  CodegateDirectoryImpl* ValidateChangeLocation(const std::string& itemname,
++                                                const std::string& dst_dir);
++
++  CodegateItem* FindItemByName(const std::string& name) const;
++  std::unique_ptr<CodegateItem> RemoveItemByName(const std::string& name);
++
++  bool IsItemNameExists(const std::string& itemname) const;
++  bool IsValidFile(const std::string& itemname) const;
++  bool IsValidDirectory(const std::string& dirname) const;
++
++  std::vector<std::string> GetItemNameList() const;
++
++  mojo::ReceiverSet<blink::mojom::cfs::CodegateDirectory> receivers_;
++  std::vector<std::unique_ptr<CodegateItem>> item_list_;
++  base::WeakPtrFactory<CodegateDirectoryImpl> weak_factory_{this};
++};
++#endif  // CONTENT_BROWSER_CFS_CFS_DIRECTORY_IMPL_H_
+diff --git a/content/browser/CFS/cfs_file_impl.cc b/content/browser/CFS/cfs_file_impl.cc
+new file mode 100644
+index 0000000000000..69a56fe95b1d2
+--- /dev/null
++++ b/content/browser/CFS/cfs_file_impl.cc
+@@ -0,0 +1,65 @@
++// content/browser/CFS/cfs_file_impl.cc
++
++// content
++#include "content/browser/CFS/cfs_file_impl.h"
++
++#include "content/browser/CFS/cfs_directory_impl.h"
++#include "content/browser/CFS/cfs_manager_impl.h"
++
++// Base
++#include "base/task/task_traits.h"
++#include "base/task/thread_pool.h"
++
++CodegateFileImpl::CodegateFileImpl(const std::string& filename)
++    : CodegateItem(filename, TYPE_FILE) {}
++
++CodegateFileImpl::~CodegateFileImpl() {}
++
++void CodegateFileImpl::GetFilename(GetFilenameCallback callback) {
++  std::move(callback).Run(GetItemName());
++}
++
++void CodegateFileImpl::Write(const std::vector<uint8_t>& data,
++                             WriteCallback callback) {
++  data_buffer_ = data;
++  std::move(callback).Run(true);
++}
++
++void CodegateFileImpl::Read(ReadCallback callback) {
++  std::vector<uint8_t> data = data_buffer_;
++  std::move(callback).Run(true, data);
++}
++
++void CodegateFileImpl::Edit(uint32_t idx, uint8_t value, EditCallback callback) {
++  if (idx < data_buffer_.size()) {
++    data_buffer_[idx] = value;
++    std::move(callback).Run(true);
++  } else {
++    std::move(callback).Run(false);
++  }
++}
++
++void CodegateFileImpl::Close(CloseCallback callback) {
++  OnReceiverDisconnect();
++  std::move(callback).Run(true);
++}
++
++void CodegateFileImpl::AddReceiver(
++    mojo::PendingReceiver<blink::mojom::cfs::CodegateFile> receiver) {
++  receivers_.Add(this, std::move(receiver));
++  receivers_.set_disconnect_handler(base::BindRepeating(
++      &CodegateFileImpl::OnReceiverDisconnect, base::Unretained(this)));
++}
++
++mojo::PendingRemote<blink::mojom::cfs::CodegateFile>
++CodegateFileImpl::GenerateConnection() {
++  mojo::PendingRemote<blink::mojom::cfs::CodegateFile> remote;
++  AddReceiver(remote.InitWithNewPipeAndPassReceiver());
++  return remote;
++}
++
++  void CodegateFileImpl::OnReceiverDisconnect() {
++    if (receivers_.current_receiver()) {
++      receivers_.Remove(receivers_.current_receiver());
++    }
++  }
+diff --git a/content/browser/CFS/cfs_file_impl.h b/content/browser/CFS/cfs_file_impl.h
+new file mode 100644
+index 0000000000000..9b3a7f89f0149
+--- /dev/null
++++ b/content/browser/CFS/cfs_file_impl.h
+@@ -0,0 +1,50 @@
++#ifndef CONTENT_BROWSER_CFS_CFS_FILE_IMPL_H_
++#define CONTENT_BROWSER_CFS_CFS_FILE_IMPL_H_
++
++// library
++#include <map>
++#include <string>
++#include <vector>
++
++// content
++#include "content/browser/CFS/cfs_directory_impl.h"
++#include "content/browser/CFS/cfs_item.h"
++#include "content/browser/CFS/cfs_manager_impl.h"
++
++// mojo dependency
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++
++// mojo IPC Rule
++#include "third_party/blink/public/mojom/CFS/cfs.mojom.h"
++
++class CodegateDirectoryImpl;
++
++class CodegateFileImpl
++    : public blink::mojom::cfs::CodegateFile,
++      public CodegateItem {
++ public:
++  explicit CodegateFileImpl(const std::string& filename);
++  ~CodegateFileImpl() override;
++
++  CodegateFileImpl(const CodegateFileImpl&) = delete;
++  CodegateFileImpl& operator=(const CodegateFileImpl&) = delete;
++
++  // Mojo IDL
++  void GetFilename(GetFilenameCallback callback) override;
++  void Write(const std::vector<uint8_t>& data, WriteCallback callback) override;
++  void Read(ReadCallback callback) override;
++  void Edit(uint32_t idx, uint8_t value, EditCallback callback) override;
++  void Close(CloseCallback callback) override;
++
++    void AddReceiver(mojo::PendingReceiver<blink::mojom::cfs::CodegateFile> receiver);
++  mojo::PendingRemote<blink::mojom::cfs::CodegateFile> GenerateConnection();
++  void OnReceiverDisconnect();
++ private:
++  mojo::ReceiverSet<blink::mojom::cfs::CodegateFile> receivers_;
++  std::vector<uint8_t> data_buffer_;
++  base::WeakPtrFactory<CodegateFileImpl> weak_factory_{this};
++};
++#endif  // CONTENT_BROWSER_CFS_CFS_FILE_IMPL_H_
+diff --git a/content/browser/CFS/cfs_item.h b/content/browser/CFS/cfs_item.h
+new file mode 100644
+index 0000000000000..455a61db41b6f
+--- /dev/null
++++ b/content/browser/CFS/cfs_item.h
+@@ -0,0 +1,32 @@
++#ifndef CONTENT_BROWSER_CFS_CFS_ITEM_H
++#define CONTENT_BROWSER_CFS_CFS_ITEM_H
++
++#define TYPE_FILE 1
++#define TYPE_DIRECTORY 2
++
++#include "base/memory/weak_ptr.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
++
++class CodegateDirectoryImpl;
++
++class CodegateItem {
++ public:
++  CodegateItem(std::string itemname, int itemtype) : 
++      itemtype_(itemtype), itemname_(std::move(itemname)), parents_dir_(nullptr) {}
++  virtual ~CodegateItem() = default;
++
++  CodegateDirectoryImpl* GetParentDir() const { return parents_dir_.get(); }
++  void SetParentDir(CodegateDirectoryImpl* t) { parents_dir_ = t; }
++
++  std::string GetItemName() const { return itemname_; }
++  void SetItemName(std::string newname) { itemname_ = newname; }
++  int GetItemType() const { return itemtype_; }
++
++ private:
++  int itemtype_;
++  std::string itemname_;
++  raw_ptr<CodegateDirectoryImpl> parents_dir_;
++};
++#endif  // CONTENT_BROWSER_CFS_CFS_ITEM_H
+diff --git a/content/browser/CFS/cfs_manager_impl.cc b/content/browser/CFS/cfs_manager_impl.cc
+new file mode 100644
+index 0000000000000..5e7223256d03a
+--- /dev/null
++++ b/content/browser/CFS/cfs_manager_impl.cc
+@@ -0,0 +1,47 @@
++// content/browser/CFS/cfs_manager_impl.cc
++
++#include "content/browser/CFS/cfs_manager_impl.h"
++
++CodegateFSManagerImpl::CodegateFSManagerImpl() : cnt_(0) {}
++
++CodegateFSManagerImpl::~CodegateFSManagerImpl() = default;
++
++void CodegateFSManagerImpl::CreateFileSystem(
++    CreateFileSystemCallback callback) {
++  std::unique_ptr<CodegateDirectoryImpl> root_dir =
++      std::make_unique<CodegateDirectoryImpl>("root");
++  auto remote = root_dir->GenerateConnection();
++  file_system_list_.emplace(++cnt_, std::move(root_dir));
++  std::move(callback).Run(cnt_, std::move(remote));
++}
++
++void CodegateFSManagerImpl::DeleteFileSystem(
++    uint32_t id,
++    DeleteFileSystemCallback callback) {
++  if (!file_system_list_[id]) {
++    std::move(callback).Run(false);
++    return;
++  } else {
++    file_system_list_.erase(id);
++    std::move(callback).Run(true);
++    return;
++  }
++}
++
++void CodegateFSManagerImpl::GetFileSystemHandle(
++    uint32_t id,
++    GetFileSystemHandleCallback callback) {
++  if (!file_system_list_[id]) {
++    std::move(callback).Run(false, mojo::PendingRemote<blink::mojom::cfs::CodegateDirectory>());
++    return;
++  } else {
++    CodegateDirectoryImpl* target = file_system_list_[id].get();
++    auto remote = target->GenerateConnection();
++    std::move(callback).Run(true, std::move(remote));
++    return;
++  }
++}
++
++void CodegateFSManagerImpl::GetCode(GetCodeCallback callback) {
++  std::move(callback).Run((uint64_t)(&CodegateFSManagerImpl::Create));
++}
+diff --git a/content/browser/CFS/cfs_manager_impl.h b/content/browser/CFS/cfs_manager_impl.h
+new file mode 100644
+index 0000000000000..47cc38f96f233
+--- /dev/null
++++ b/content/browser/CFS/cfs_manager_impl.h
+@@ -0,0 +1,45 @@
++#ifndef CONTENT_BROWSER_CFS_CFS_MANAGER_IMPL_H_
++#define CONTENT_BROWSER_CFS_CFS_MANAGER_IMPL_H_
++
++// library
++#include <cstdint>
++
++// content
++#include "content/browser/CFS/cfs_directory_impl.h"
++#include "content/browser/CFS/cfs_file_impl.h"
++
++// mojo dependency
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++
++// mojo IPC Rule
++#include "third_party/blink/public/mojom/CFS/cfs.mojom.h"
++
++class CodegateDirectoryImpl;
++
++class CodegateFSManagerImpl : public blink::mojom::cfs::CodegateFSManager {
++ public:
++  static void Create(
++      mojo::PendingReceiver<blink::mojom::cfs::CodegateFSManager> receiver) {
++    mojo::MakeSelfOwnedReceiver(std::make_unique<CodegateFSManagerImpl>(),
++                                std::move(receiver));
++  }
++
++  CodegateFSManagerImpl();
++  ~CodegateFSManagerImpl() override;
++
++  void CreateFileSystem(
++      CreateFileSystemCallback callback) override;
++  void DeleteFileSystem(uint32_t id,
++                        DeleteFileSystemCallback callback) override;
++  void GetFileSystemHandle(
++      uint32_t id,
++      GetFileSystemHandleCallback callback) override;
++
++  void GetCode(GetCodeCallback callback) override;
++ private:
++  uint32_t cnt_;
++  std::map<uint32_t, std::unique_ptr<CodegateDirectoryImpl>> file_system_list_;
++};
++#endif  // CONTENT_BROWSER_CFS_CFS_MANAGER_IMPL_H_
+diff --git a/content/browser/browser_interface_binders.cc b/content/browser/browser_interface_binders.cc
+index eda13ba3ccb04..463fe1a3880cb 100644
+--- a/content/browser/browser_interface_binders.cc
++++ b/content/browser/browser_interface_binders.cc
+@@ -199,6 +199,9 @@
+ #include "third_party/blink/public/public_buildflags.h"
+ #include "url/origin.h"
+ 
++#include "content/browser/CFS/cfs_manager_impl.h"
++#include "third_party/blink/public/mojom/CFS/cfs.mojom.h"
++
+ #if BUILDFLAG(IS_ANDROID)
+ #include "content/browser/android/text_suggestion_host_android.h"
+ #include "content/browser/renderer_host/render_widget_host_view_android.h"
+@@ -746,8 +749,12 @@ void BindDevicePostureProvider(
+ 
+ }  // namespace
+ 
++
+ // Documents/frames
+ void PopulateFrameBinders(RenderFrameHostImpl* host, mojo::BinderMap* map) {
++  map->Add<blink::mojom::cfs::CodegateFSManager>(base::BindRepeating(
++      &RenderFrameHostImpl::GetCodegateFSManager, base::Unretained(host)));
++
+   map->Add<blink::mojom::AudioContextManager>(base::BindRepeating(
+       &RenderFrameHostImpl::GetAudioContextManager, base::Unretained(host)));
+ 
+diff --git a/content/browser/renderer_host/render_frame_host_impl.cc b/content/browser/renderer_host/render_frame_host_impl.cc
+index 23cd457563d7d..ad2df6b97aa1d 100644
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -310,6 +310,8 @@
+ #include "url/origin.h"
+ #include "url/url_constants.h"
+ 
++#include "content/browser/CFS/cfs_manager_impl.h"
++
+ #if BUILDFLAG(IS_ANDROID)
+ #include "content/browser/accessibility/browser_accessibility_manager_android.h"
+ #include "content/browser/android/content_url_loader_factory.h"
+@@ -14264,6 +14266,11 @@ void RenderFrameHostImpl::BindTrustTokenQueryAnswerer(
+       std::move(receiver), ComputeTopFrameOrigin(GetLastCommittedOrigin()));
+ }
+ 
++void RenderFrameHostImpl::GetCodegateFSManager(
++  mojo::PendingReceiver<blink::mojom::cfs::CodegateFSManager> receiver) {
++    CodegateFSManagerImpl::Create(std::move(receiver));
++}
++
+ void RenderFrameHostImpl::GetAudioContextManager(
+     mojo::PendingReceiver<blink::mojom::AudioContextManager> receiver) {
+   AudioContextManagerImpl::Create(this, std::move(receiver));
+diff --git a/content/browser/renderer_host/render_frame_host_impl.h b/content/browser/renderer_host/render_frame_host_impl.h
+index 9093d52a27de1..4add0ad466a2f 100644
+--- a/content/browser/renderer_host/render_frame_host_impl.h
++++ b/content/browser/renderer_host/render_frame_host_impl.h
+@@ -198,6 +198,8 @@
+ #include "ui/gfx/geometry/rect.h"
+ #include "url/gurl.h"
+ 
++#include "third_party/blink/public/mojom/CFS/cfs.mojom.h"
++
+ #if BUILDFLAG(IS_ANDROID)
+ #include "base/containers/id_map.h"
+ #include "content/browser/webauth/webauth_request_security_checker.h"
+@@ -2063,6 +2065,9 @@ class CONTENT_EXPORT RenderFrameHostImpl
+   // Set the `frame_` for sending messages to the renderer process.
+   void SetMojomFrameRemote(mojo::PendingAssociatedRemote<mojom::Frame>);
+ 
++  void GetCodegateFSManager(
++    mojo::PendingReceiver<blink::mojom::cfs::CodegateFSManager> receiver);
++
+   void GetAudioContextManager(
+       mojo::PendingReceiver<blink::mojom::AudioContextManager> receiver);
+ 
+diff --git a/third_party/blink/public/mojom/BUILD.gn b/third_party/blink/public/mojom/BUILD.gn
+index 012809d6f8d7f..7a798963e8b18 100644
+--- a/third_party/blink/public/mojom/BUILD.gn
++++ b/third_party/blink/public/mojom/BUILD.gn
+@@ -262,6 +262,7 @@ mojom("mojom_platform") {
+     "worker/worker_main_script_load_params.mojom",
+     "worker/worker_options.mojom",
+     "worker/worklet_global_scope_creation_params.mojom",
++    "CFS/cfs.mojom",
+   ]
+ 
+   if (is_android) {
+diff --git a/third_party/blink/public/mojom/CFS/cfs.mojom b/third_party/blink/public/mojom/CFS/cfs.mojom
+new file mode 100644
+index 0000000000000..c457133697944
+--- /dev/null
++++ b/third_party/blink/public/mojom/CFS/cfs.mojom
+@@ -0,0 +1,42 @@
++module blink.mojom.cfs;
++
++enum ITEMTYPE {
++    kFailed,
++    kFile,
++    kDir,
++};
++
++union CodegateItemResponse {
++  pending_remote<CodegateDirectory> remote_dir;
++  pending_remote<CodegateFile> remote_file;
++};
++
++interface CodegateFSManager {
++  CreateFileSystem() => (uint32 id, pending_remote<CodegateDirectory> remote_dir);
++  DeleteFileSystem(uint32 id) => (bool success);
++  GetFileSystemHandle(uint32 id) => (bool success, pending_remote<CodegateDirectory>? remote_dir);
++
++  /// You have a compromised renderer, right?
++  GetCode() => (uint64 addr);
++};
++
++interface CodegateDirectory {
++  GetItemHandle(string filename) => (ITEMTYPE type, CodegateItemResponse? remote_item);
++
++  CreateItem(string filename, ITEMTYPE type) => (ITEMTYPE type, CodegateItemResponse? remote_item);
++  DeleteItem(string filename) => (bool success);
++
++  RenameItem(string filename_orig, string filename_new) => (bool success);
++  ChangeItemLocation(string filename_src, string filename_dst) => (ITEMTYPE type, CodegateItemResponse? remote_item);
++
++  ListItems() => (array<string> data);
++  GetPwd() => (string data);
++};
++
++interface CodegateFile {
++  GetFilename() => (string filename);
++  Read() => (bool success, array<uint8>? data);
++  Write(array<uint8> data) => (bool success);
++  Edit(uint32 idx, uint8 value) => (bool success);
++  Close() => (bool success);
++};
+diff --git a/third_party/blink/renderer/bindings/generated_in_modules.gni b/third_party/blink/renderer/bindings/generated_in_modules.gni
+index 3e985636ea41c..1686521c3b30e 100644
+--- a/third_party/blink/renderer/bindings/generated_in_modules.gni
++++ b/third_party/blink/renderer/bindings/generated_in_modules.gni
+@@ -1970,6 +1970,10 @@ if (enable_compute_pressure) {
+ }
+ 
+ generated_interface_sources_in_modules = [
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_mini_shell.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_mini_shell.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_mini_shell_manager.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_mini_shell_manager.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_abort_payment_event.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_abort_payment_event.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_absolute_orientation_sensor.cc",
+diff --git a/third_party/blink/renderer/bindings/idl_in_modules.gni b/third_party/blink/renderer/bindings/idl_in_modules.gni
+index 35714f58531db..f907552a7451f 100644
+--- a/third_party/blink/renderer/bindings/idl_in_modules.gni
++++ b/third_party/blink/renderer/bindings/idl_in_modules.gni
+@@ -8,6 +8,8 @@ import("//third_party/blink/renderer/config.gni")
+ # Statically-defined (not build-time-generated) IDL files in 'modules' component
+ # for production.
+ static_idl_files_in_modules = [
++  "//third_party/blink/renderer/modules/minishell/mini_shell.idl",
++  "//third_party/blink/renderer/modules/minishell/mini_shell_manager.idl",
+   "//third_party/blink/renderer/modules/ad_auction/ad_auction_data_config.idl",
+   "//third_party/blink/renderer/modules/ad_auction/ad_request_config.idl",
+   "//third_party/blink/renderer/modules/ad_auction/ads.idl",
+diff --git a/third_party/blink/renderer/modules/BUILD.gn b/third_party/blink/renderer/modules/BUILD.gn
+index e9a79f666c981..f3d4438fb62c7 100644
+--- a/third_party/blink/renderer/modules/BUILD.gn
++++ b/third_party/blink/renderer/modules/BUILD.gn
+@@ -54,6 +54,7 @@ component("modules") {
+ 
+   sub_modules = [
+     ":modules_generated",
++    "//third_party/blink/renderer/modules/minishell",
+     "//third_party/blink/renderer/bindings/modules/v8",
+     "//third_party/blink/renderer/modules/accessibility",
+     "//third_party/blink/renderer/modules/ad_auction",
+diff --git a/third_party/blink/renderer/modules/minishell/BUILD.gn b/third_party/blink/renderer/modules/minishell/BUILD.gn
+new file mode 100644
+index 0000000000000..fb09b3798b805
+--- /dev/null
++++ b/third_party/blink/renderer/modules/minishell/BUILD.gn
+@@ -0,0 +1,21 @@
++# Copyright 2018 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//third_party/blink/renderer/modules/modules.gni")
++
++blink_modules_sources("minishell") {
++  sources = [
++    "mini_shell_manager.cc",
++    "mini_shell_manager.h",
++    "mini_shell.cc",
++    "mini_shell.h",
++    "file_buffer.cc",
++    "window_mini_shell_manager.cc",
++    "window_mini_shell_manager.h",
++  ]
++
++  deps = [
++  ]
++
++}
+diff --git a/third_party/blink/renderer/modules/minishell/file_buffer.cc b/third_party/blink/renderer/modules/minishell/file_buffer.cc
+new file mode 100644
+index 0000000000000..c960e3332d769
+--- /dev/null
++++ b/third_party/blink/renderer/modules/minishell/file_buffer.cc
+@@ -0,0 +1,61 @@
++#include "third_party/blink/renderer/modules/minishell/mini_shell.h"
++
++namespace blink {
++
++FileBuffer::FileBuffer(
++    mojo::PendingRemote<mojom::cfs::blink::CodegateFile> new_file_remote,
++    ScriptPromiseResolver<IDLString>* resolver)
++    : remote_(ExecutionContext::From(resolver->GetScriptState())), idx_(0) {
++  remote_.Bind(std::move(new_file_remote),
++               ExecutionContext::From(resolver->GetScriptState())
++                   ->GetTaskRunner(TaskType::kInternalDefault));
++  GetRemote()->Read(WTF::BindOnce(
++      [](FileBuffer* filebuffer, ScriptPromiseResolver<IDLString>* resolver,
++         bool success, const std::optional<WTF::Vector<uint8_t>>& content) {
++        if (success) {
++          filebuffer->write(content.value());
++          resolver->Resolve("File opened");
++        } else {
++          resolver->Reject(MakeGarbageCollected<DOMException>(
++              DOMExceptionCode::kOperationError, "Failed to open file."));
++        }
++      },
++      WrapPersistent(this), WrapPersistent(resolver)));
++}
++
++Vector<uint8_t> FileBuffer::read(uint64_t count) {
++  Vector<uint8_t> res(count);
++
++  if (count > FILESIZE_MAX) {
++    return Vector<uint8_t>();
++  }
++
++  for (uint64_t i = 0; i < count; i++) {
++    res[i] = buffer_[idx_ + i];
++  }
++  return res;
++}
++
++void FileBuffer::write(const Vector<uint8_t>& data) {
++  if (data.size() > FILESIZE_MAX) {
++    return;
++  }
++
++  for (uint64_t i = 0; i < data.size(); i++) {
++    buffer_[idx_ + i] = data[i];
++  }
++}
++
++void FileBuffer::SetIdx(uint64_t idx) {
++  idx_ = idx;
++}
++
++void FileBuffer::Trace(Visitor* visitor) const {
++  visitor->Trace(remote_);
++}
++
++mojom::cfs::blink::CodegateFile* FileBuffer::GetRemote() {
++  return remote_.get();
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/minishell/mini_shell.cc b/third_party/blink/renderer/modules/minishell/mini_shell.cc
+new file mode 100644
+index 0000000000000..c18a80281852d
+--- /dev/null
++++ b/third_party/blink/renderer/modules/minishell/mini_shell.cc
+@@ -0,0 +1,558 @@
++// third_party/blink/renderer/modules/minishell/mini_shell.cc
++
++#include "third_party/blink/renderer/modules/minishell/mini_shell.h"
++
++#include "base/memory/raw_ptr.h"
++#include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
++
++namespace blink {
++
++WTF::String ConvertVectorToHexString(const WTF::Vector<uint8_t>& vec,
++                                     size_t size) {
++  StringBuilder res;
++  size_t count = 0;
++
++  for (uint8_t i : vec) {
++    if (count >= size) {
++      break;
++    }
++
++    if (count++ > 0) {
++      res.Append(" ");
++    }
++
++    char data[3];
++    snprintf(data, sizeof(data), "%02x", i);
++    res.Append(data);
++  }
++  return res.ToString();
++}
++
++Vector<WTF::String> ParseShellArguments(const WTF::String& input) {
++  Vector<WTF::String> cmd_input;
++  if (input.IsNull() || input.empty()) {
++    return cmd_input;
++  }
++
++  std::string s = input.Utf8();
++  size_t total_idx = 0;
++  const size_t len = s.length();
++
++  while (total_idx < len) {
++    while (total_idx < len &&
++           std::isspace(static_cast<unsigned char>(s[total_idx]))) {
++      total_idx++;
++    }
++
++    if (total_idx == len) {
++      break;
++    }
++
++    std::string cur_tok;
++    if (s[total_idx] == '"') {
++      total_idx++;
++      while (total_idx < len && s[total_idx] != '"') {
++        cur_tok += s[total_idx];
++        total_idx++;
++      }
++      if (total_idx < len && s[total_idx] == '"') {
++        total_idx++;
++      }
++    } else {
++      while (total_idx < len &&
++             !std::isspace(static_cast<unsigned char>(s[total_idx]))) {
++        cur_tok += s[total_idx];
++        total_idx++;
++      }
++    }
++    cmd_input.push_back(WTF::String::FromUTF8(cur_tok.c_str()));
++  }
++  return cmd_input;
++}
++
++MiniShell::MiniShell(
++    ScriptState* script_state,
++    mojo::PendingRemote<mojom::cfs::blink::CodegateDirectory> new_remote,
++    uint32_t id)
++    : dir_remote_(ExecutionContext::From(script_state)),
++      file_descriptor_(nullptr),
++      shell_id_(id) {
++  dir_remote_.Bind(std::move(new_remote),
++                   ExecutionContext::From(script_state)
++                       ->GetTaskRunner(TaskType::kInternalDefault));
++}
++
++MiniShell::~MiniShell() = default;
++
++uint32_t MiniShell::get_id(ScriptState* script_state,
++                           ExceptionState& exception_state) {
++  return shell_id_;
++}
++
++ScriptPromise<IDLString> MiniShell::execute(ScriptState* script_state,
++                                            const String& raw_input,
++                                            ExceptionState& exception_state) {
++  auto* resolver =
++      MakeGarbageCollected<ScriptPromiseResolver<IDLString>>(script_state);
++  ScriptPromise<IDLString> promise = resolver->Promise();
++
++  if (!dir_remote_.is_bound()) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kInvalidStateError, "Dead Pipe"));
++    return promise;
++  }
++
++  Vector<String> cmd_input = ParseShellArguments(raw_input);
++
++  if (cmd_input.empty()) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "Input Error"));
++    return promise;
++  }
++
++  String command = cmd_input[0];
++
++  if (command == "help") {
++    FUNC_HELP(resolver, cmd_input);
++  } else if (command == "pwd") {
++    FUNC_PWD(resolver, cmd_input);
++  } else if (command == "ls") {
++    FUNC_LS(resolver, cmd_input);
++  } else if (command == "mkdir") {
++    FUNC_MKDIR(resolver, cmd_input);
++  } else if (command == "cd") {
++    FUNC_CD(resolver, cmd_input);
++  } else if (command == "touch") {
++    FUNC_TOUCH(resolver, cmd_input);
++  } else if (command == "delete") {
++    FUNC_DELETE(resolver, cmd_input);
++  } else if (command == "rename") {
++    FUNC_RENAME(resolver, cmd_input);
++  } else if (command == "exec") {
++    FUNC_EXEC(resolver, cmd_input);
++  } else if (command == "mvdir") {
++    FUNC_MVDIR(resolver, cmd_input);
++  } else if (command == "open") {
++    FUNC_OPEN(resolver, cmd_input);
++  } else if (command == "read") {
++    FUNC_READ(resolver, cmd_input);
++  } else if (command == "write") {
++    FUNC_WRITE(resolver, cmd_input);
++  } else if (command == "seek") {
++    FUNC_SEEK(resolver, cmd_input);
++  } else if (command == "save") {
++    FUNC_SAVE(resolver, cmd_input);
++  } else {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "Unknown command: " + command));
++  }
++  return promise;
++}
++
++void MiniShell::FUNC_HELP(ScriptPromiseResolver<IDLString>* resolver,
++                          const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 1) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "help: too many arguments."));
++    return;
++  }
++  WTF::StringBuilder res;
++  res.Append("Available commands:\n");
++  res.Append("  help\n");
++  res.Append("  pwd\n");
++  res.Append("  ls\n");
++  res.Append("  mkdir <dirname>\n");
++  res.Append("  cd <path>\n");
++  res.Append("  touch <filename>\n");
++  res.Append("  delete <filename>\n");
++  res.Append("  rename <oldname> <newname>\n");
++  res.Append("  exec <filename>\n");
++  res.Append("  mvdir <src> <dst_parent_dir | new_dir_name_if_renaming>\n");
++
++  res.Append("  open <filepath>\n");
++  res.Append("  read <count>\n");
++  res.Append("  write <count> {hex1} {hex2} {hex3} . . .\n");
++  res.Append("  seek <idx>\n");
++  res.Append("  save\n");
++  resolver->Resolve(res.ToString());
++  return;
++}
++
++void MiniShell::FUNC_PWD(ScriptPromiseResolver<IDLString>* resolver,
++                         const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 1) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "pwd: too many arguments."));
++    return;
++  }
++
++  GetDirectoryRemote()->GetPwd(WTF::BindOnce(
++      [](MiniShell* minishell, ScriptPromiseResolver<IDLString>* resolver,
++         const String& current_path) { resolver->Resolve(current_path); },
++      WrapPersistent(this), WrapPersistent(resolver)));
++}
++
++void MiniShell::FUNC_LS(ScriptPromiseResolver<IDLString>* resolver,
++                        const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 1) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "ls: too many arguments."));
++    return;
++  }
++  GetDirectoryRemote()->ListItems(WTF::BindOnce(
++      [](MiniShell* minishell, ScriptPromiseResolver<IDLString>* resolver,
++         const Vector<String>& entries) {
++        StringBuilder output;
++        for (const auto& entry : entries) {
++          output.Append(entry);
++          output.Append("\n");
++        }
++        resolver->Resolve(output.ToString());
++      },
++      WrapPersistent(this), WrapPersistent(resolver)));
++}
++
++void MiniShell::FUNC_MKDIR(ScriptPromiseResolver<IDLString>* resolver,
++                           const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 2) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "mkdir <dirname>"));
++    return;
++  }
++  String dirname = cmd_input[1];
++
++  GetDirectoryRemote()->CreateItem(
++      dirname, blink::mojom::cfs::ITEMTYPE::kDir,
++      WTF::BindOnce(
++          [](MiniShell* minishell, ScriptPromiseResolver<IDLString>* resolver,
++             blink::mojom::cfs::ITEMTYPE type,
++             blink::mojom::cfs::blink::CodegateItemResponsePtr item) {
++            if (type == blink::mojom::cfs::ITEMTYPE::kDir) {
++              resolver->Resolve("Directory created.");
++            } else {
++              resolver->Reject(MakeGarbageCollected<DOMException>(
++                  DOMExceptionCode::kOperationError,
++                  "Failed to create directory."));
++            }
++          },
++          WrapPersistent(this), WrapPersistent(resolver)));
++}
++
++void MiniShell::FUNC_CD(ScriptPromiseResolver<IDLString>* resolver,
++                        const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 2) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "cd <path>"));
++    return;
++  }
++
++  String path = cmd_input[1];
++  GetDirectoryRemote()->GetItemHandle(
++      path,
++      WTF::BindOnce(
++          [](MiniShell* minishell, ScriptPromiseResolver<IDLString>* resolver,
++             blink::mojom::cfs::ITEMTYPE type,
++             blink::mojom::cfs::blink::CodegateItemResponsePtr item) {
++            if (type == blink::mojom::cfs::ITEMTYPE::kDir) {
++              minishell->SetDirectory(std::move(item->get_remote_dir()),
++                                      resolver->GetExecutionContext());
++              resolver->Resolve("Changed directory");
++            } else if (type == blink::mojom::cfs::ITEMTYPE::kFile) {
++              resolver->Reject(MakeGarbageCollected<DOMException>(
++                  DOMExceptionCode::kOperationError,
++                  "Cannot change directory to a file."));
++              return;
++            } else {
++              resolver->Reject(MakeGarbageCollected<DOMException>(
++                  DOMExceptionCode::kNotFoundError, "Directory not found."));
++              return;
++            }
++          },
++          WrapPersistent(this), WrapPersistent(resolver)));
++}
++
++void MiniShell::FUNC_TOUCH(ScriptPromiseResolver<IDLString>* resolver,
++                           const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 2) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "touch <filename>"));
++    return;
++  }
++  String filename = cmd_input[1];
++
++  GetDirectoryRemote()->CreateItem(
++      filename, blink::mojom::cfs::ITEMTYPE::kFile,
++      WTF::BindOnce(
++          [](MiniShell* minishell, ScriptPromiseResolver<IDLString>* resolver,
++             blink::mojom::cfs::ITEMTYPE type,
++             blink::mojom::cfs::blink::CodegateItemResponsePtr item) {
++            if (type == blink::mojom::cfs::ITEMTYPE::kFile) {
++              resolver->Resolve("File touched.");
++            } else {
++              resolver->Reject(MakeGarbageCollected<DOMException>(
++                  DOMExceptionCode::kOperationError, "Failed to touch file."));
++            }
++          },
++          WrapPersistent(this), WrapPersistent(resolver)));
++}
++
++void MiniShell::FUNC_DELETE(ScriptPromiseResolver<IDLString>* resolver,
++                            const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 2) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "delete <filename>"));
++    return;
++  }
++
++  if (GetBuffer()) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kAbortError, "Save File First"));
++    return;
++  }
++
++  String filename_to_delete = cmd_input[1];
++
++  GetDirectoryRemote()->DeleteItem(
++      filename_to_delete,
++      WTF::BindOnce(
++          [](MiniShell* minishell, ScriptPromiseResolver<IDLString>* resolver,
++             bool success) {
++            if (success) {
++              resolver->Resolve("File deleted.");
++            } else {
++              resolver->Reject(MakeGarbageCollected<DOMException>(
++                  DOMExceptionCode::kOperationError, "Failed to delete file."));
++            }
++          },
++          WrapPersistent(this), WrapPersistent(resolver)));
++}
++
++void MiniShell::FUNC_RENAME(ScriptPromiseResolver<IDLString>* resolver,
++                            const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 3) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "rename <oldname> <newname>"));
++    return;
++  }
++  String old_name = cmd_input[1];
++  String new_name = cmd_input[2];
++
++  GetDirectoryRemote()->RenameItem(
++      old_name, new_name,
++      WTF::BindOnce(
++          [](MiniShell* minishell, ScriptPromiseResolver<IDLString>* resolver,
++             bool success) {
++            if (success) {
++              resolver->Resolve("File renamed.");
++            } else {
++              resolver->Reject(MakeGarbageCollected<DOMException>(
++                  DOMExceptionCode::kOperationError, "Failed to rename file."));
++            }
++          },
++          WrapPersistent(this), WrapPersistent(resolver)));
++}
++
++void MiniShell::FUNC_EXEC(ScriptPromiseResolver<IDLString>* resolver,
++                          const Vector<String>& cmd_input) {
++  resolver->Reject(MakeGarbageCollected<DOMException>(
++      DOMExceptionCode::kAbortError, "Not Implement."));
++}
++
++void MiniShell::FUNC_MVDIR(ScriptPromiseResolver<IDLString>* resolver,
++                           const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 3) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "mvdir <src> <dst>"));
++    return;
++  }
++  String source = cmd_input[1];
++  String destination = cmd_input[2];
++
++  GetDirectoryRemote()->ChangeItemLocation(
++      source, destination,
++      WTF::BindOnce(
++          [](MiniShell* minishell, ScriptPromiseResolver<IDLString>* resolver,
++             blink::mojom::cfs::ITEMTYPE type,
++             blink::mojom::cfs::blink::CodegateItemResponsePtr item) {
++            if (type == blink::mojom::cfs::ITEMTYPE::kFailed) {
++              resolver->Reject(MakeGarbageCollected<DOMException>(
++                  DOMExceptionCode::kOperationError, "Failed to move."));
++            } else {
++              resolver->Resolve("Moved successfully.");
++            }
++          },
++          WrapPersistent(this), WrapPersistent(resolver)));
++}
++
++void MiniShell::FUNC_OPEN(ScriptPromiseResolver<IDLString>* resolver,
++                          const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 2) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "open <filepath>"));
++    return;
++  }
++
++  if (GetBuffer() != nullptr) {
++    resolver->Resolve("Close Current File Handle");
++    return;
++  }
++
++  String filepath = cmd_input[1];
++
++  GetDirectoryRemote()->GetItemHandle(
++      filepath,
++      WTF::BindOnce(
++          [](MiniShell* minishell, ScriptPromiseResolver<IDLString>* resolver,
++             blink::mojom::cfs::ITEMTYPE type,
++             blink::mojom::cfs::blink::CodegateItemResponsePtr item) {
++            if (type != blink::mojom::cfs::ITEMTYPE::kFile) {
++              resolver->Reject(MakeGarbageCollected<DOMException>(
++                  DOMExceptionCode::kNotFoundError, "Failed to open file."));
++              return;
++            }
++            minishell->SetBuffer(std::move(item->get_remote_file()),
++                                 WrapPersistent(resolver));
++          },
++          WrapPersistent(this), WrapPersistent(resolver)));
++}
++
++void MiniShell::FUNC_READ(ScriptPromiseResolver<IDLString>* resolver,
++                          const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 2) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "read <count>"));
++    return;
++  }
++
++  if (GetBuffer() == nullptr) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kAbortError, "Open File First"));
++    return;
++  }
++
++  uint64_t read_size = std::stoull(cmd_input[1].Ascii().c_str());
++
++  Vector<uint8_t> res = GetBuffer()->read(read_size);
++  resolver->Resolve(ConvertVectorToHexString(res, res.size()));
++  return;
++}
++
++void MiniShell::FUNC_WRITE(ScriptPromiseResolver<IDLString>* resolver,
++                           const Vector<String>& cmd_input) {
++  if (cmd_input.size() < 3) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "write <count> {hex1}  . . ."));
++    return;
++  }
++  if (GetBuffer() == nullptr) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kAbortError, "Open File First"));
++    return;
++  }
++
++  uint64_t write_size = std::stoull(cmd_input[1].Ascii().c_str());
++  if (write_size + 2 != cmd_input.size()) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError,
++        "Invalid Write Size : write <count> {hex1}  . . ."));
++    return;
++  }
++
++  Vector<uint8_t> write_data;
++  for (size_t i = 2; i < cmd_input.size(); ++i) {
++    write_data.push_back(std::stoul(cmd_input[i].Ascii().c_str(), nullptr, 16));
++  }
++
++  GetBuffer()->write(write_data);
++  resolver->Resolve("write successed");
++}
++
++void MiniShell::FUNC_SEEK(ScriptPromiseResolver<IDLString>* resolver,
++                          const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 2) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "seek <idx>"));
++    return;
++  }
++
++  if (GetBuffer() == nullptr) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kAbortError, "Open File First"));
++    return;
++  }
++
++  uint64_t seek_idx = std::stoull(cmd_input[1].Ascii().c_str());
++  GetBuffer()->SetIdx(seek_idx);
++  resolver->Resolve("Seek successed");
++}
++
++void MiniShell::FUNC_SAVE(ScriptPromiseResolver<IDLString>* resolver,
++                          const Vector<String>& cmd_input) {
++  if (cmd_input.size() != 1) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kSyntaxError, "save: too many arguments."));
++    return;
++  }
++
++  if (GetBuffer() == nullptr) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kAbortError, "Open File First"));
++    return;
++  }
++
++  Vector<uint8_t> data_write = GetBuffer()->read(FILESIZE_MAX);
++
++  auto file_write_callback = WTF::BindOnce(
++      [](MiniShell* minishell, ScriptPromiseResolver<IDLString>* resolver, bool success) {
++        if (success) {
++          minishell->GetFileRemote()->Close(base::NullCallback());
++          minishell->ResetBuffer();
++          resolver->Resolve("File saved.");
++        } else {
++          resolver->Reject(MakeGarbageCollected<DOMException>(
++              DOMExceptionCode::kOperationError, "Failed to write."));
++        }
++      },
++      WrapPersistent(this), WrapPersistent(resolver));
++
++  GetFileRemote()->Write(data_write, std::move(file_write_callback));
++}
++
++void MiniShell::SetDirectory(
++    mojo::PendingRemote<mojom::cfs::blink::CodegateDirectory> new_dir_remote,
++    ExecutionContext* execution_context) {
++  dir_remote_.reset();
++  dir_remote_.Bind(std::move(new_dir_remote), execution_context->GetTaskRunner(
++                                                  TaskType::kInternalDefault));
++}
++
++void MiniShell::SetBuffer(
++    mojo::PendingRemote<mojom::cfs::blink::CodegateFile> new_file_remote,
++    ScriptPromiseResolver<IDLString>* resolver) {
++  file_descriptor_ =
++      MakeGarbageCollected<FileBuffer>(std::move(new_file_remote), resolver);
++}
++
++void MiniShell::ResetBuffer() {
++  file_descriptor_ = nullptr;
++}
++
++mojom::cfs::blink::CodegateDirectory* MiniShell::GetDirectoryRemote() {
++  return dir_remote_.get();
++}
++
++mojom::cfs::blink::CodegateFile* MiniShell::GetFileRemote() {
++  return file_descriptor_ ? file_descriptor_->GetRemote() : nullptr;
++}
++
++FileBuffer* MiniShell::GetBuffer() {
++  return file_descriptor_.Get();
++}
++
++void MiniShell::Trace(Visitor* visitor) const {
++  visitor->Trace(dir_remote_);
++  visitor->Trace(file_descriptor_);
++  ScriptWrappable::Trace(visitor);
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/minishell/mini_shell.h b/third_party/blink/renderer/modules/minishell/mini_shell.h
+new file mode 100644
+index 0000000000000..9db8e239a5ccb
+--- /dev/null
++++ b/third_party/blink/renderer/modules/minishell/mini_shell.h
+@@ -0,0 +1,119 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_MINISHELL_MINISHELL_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_MINISHELL_MINISHELL_H_
++
++// mojom
++#include "third_party/blink/public/mojom/cfs/cfs.mojom-blink.h"
++
++// blink dependency
++#include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/modules/modules_export.h"
++#include "third_party/blink/renderer/platform/bindings/exception_state.h"
++#include "third_party/blink/renderer/platform/bindings/script_state.h"
++#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++#include "third_party/blink/renderer/platform/mojo/heap_mojo_remote.h"
++#include "base/memory/scoped_refptr.h"
++
++#define FILESIZE_MAX 1024
++
++namespace blink {
++class FileBuffer;
++
++class MODULES_EXPORT MiniShell final : public ScriptWrappable {
++  DEFINE_WRAPPERTYPEINFO();
++
++ public:
++  explicit MiniShell(
++      ScriptState* script_state,
++      mojo::PendingRemote<mojom::cfs::blink::CodegateDirectory> new_remote,
++      uint32_t id);
++  ~MiniShell() override;
++
++  // IDL methods
++  // [CallWith=ScriptState, RaisesException] uint32_t get_id();
++  uint32_t get_id(ScriptState* script_state, ExceptionState& exception_state);
++
++  // [CallWith=ScriptState, RaisesException] Promise<DOMString>
++  // execute(DOMString command);
++  ScriptPromise<IDLString> execute(ScriptState* script_state,
++                                   const String& raw_input,
++                                   ExceptionState& exception_state);
++
++  void Trace(Visitor* visitor) const override;
++
++  private:
++  
++  void FUNC_HELP(ScriptPromiseResolver<IDLString>* resolver,
++                 const Vector<String>& cmd_input);
++  void FUNC_PWD(ScriptPromiseResolver<IDLString>* resolver,
++                const Vector<String>& cmd_input);
++  void FUNC_MKDIR(ScriptPromiseResolver<IDLString>* resolver,
++                  const Vector<String>& cmd_input);
++  void FUNC_LS(ScriptPromiseResolver<IDLString>* resolver,
++               const Vector<String>& cmd_input);
++  void FUNC_CD(ScriptPromiseResolver<IDLString>* resolver,
++               const Vector<String>& cmd_input);
++  void FUNC_TOUCH(ScriptPromiseResolver<IDLString>* resolver,
++                  const Vector<String>& cmd_input);
++  void FUNC_DELETE(ScriptPromiseResolver<IDLString>* resolver,
++                   const Vector<String>& cmd_input);
++  void FUNC_RENAME(ScriptPromiseResolver<IDLString>* resolver,
++                   const Vector<String>& cmd_input);
++  void FUNC_EXEC(ScriptPromiseResolver<IDLString>* resolver,
++                 const Vector<String>& cmd_input);
++  void FUNC_MVDIR(ScriptPromiseResolver<IDLString>* resolver,
++                  const Vector<String>& cmd_input);
++  void FUNC_OPEN(ScriptPromiseResolver<IDLString>* resolver,
++                 const Vector<String>& cmd_input);
++  void FUNC_READ(ScriptPromiseResolver<IDLString>* resolver,
++                 const Vector<String>& cmd_input);
++  void FUNC_WRITE(ScriptPromiseResolver<IDLString>* resolver,
++                  const Vector<String>& cmd_input);
++  void FUNC_SEEK(ScriptPromiseResolver<IDLString>* resolver,
++                 const Vector<String>& cmd_input);
++  void FUNC_SAVE(ScriptPromiseResolver<IDLString>* resolver,
++                 const Vector<String>& cmd_input);
++
++  void SetDirectory(
++      mojo::PendingRemote<mojom::cfs::blink::CodegateDirectory> new_dir_remote,
++      ExecutionContext* execution_context);
++  void SetBuffer(
++      mojo::PendingRemote<mojom::cfs::blink::CodegateFile> new_file_remote,
++      ScriptPromiseResolver<IDLString>* resolver);
++  void ResetBuffer();
++
++  mojom::cfs::blink::CodegateDirectory* GetDirectoryRemote();
++  mojom::cfs::blink::CodegateFile* GetFileRemote();
++  FileBuffer* GetBuffer();
++
++  HeapMojoRemote<mojom::cfs::blink::CodegateDirectory> dir_remote_;
++  Member<FileBuffer> file_descriptor_;
++  uint32_t shell_id_;
++};
++
++class FileBuffer : public GarbageCollected<FileBuffer> {
++
++ public:
++  explicit FileBuffer(
++      mojo::PendingRemote<mojom::cfs::blink::CodegateFile> new_file_remote,
++      ScriptPromiseResolver<IDLString>* resolver);
++
++  Vector<uint8_t> read(uint64_t count);
++  void write(const Vector<uint8_t>& data);
++
++  void SetIdx(uint64_t idx);
++
++  mojom::cfs::blink::CodegateFile* GetRemote();
++
++  void Trace(Visitor* visitor) const;
++
++ private:
++  HeapMojoRemote<mojom::cfs::blink::CodegateFile> remote_;
++  uint64_t idx_;
++  char buffer_[FILESIZE_MAX];
++
++};
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_MINISHELL_MINISHELL_H_
+diff --git a/third_party/blink/renderer/modules/minishell/mini_shell.idl b/third_party/blink/renderer/modules/minishell/mini_shell.idl
+new file mode 100644
+index 0000000000000..c993633357df5
+--- /dev/null
++++ b/third_party/blink/renderer/modules/minishell/mini_shell.idl
+@@ -0,0 +1,4 @@
++interface MiniShell {
++    [CallWith=ScriptState, RaisesException] long get_id();
++    [CallWith=ScriptState, RaisesException] Promise<DOMString> execute(DOMString command);
++};
+diff --git a/third_party/blink/renderer/modules/minishell/mini_shell_manager.cc b/third_party/blink/renderer/modules/minishell/mini_shell_manager.cc
+new file mode 100644
+index 0000000000000..d89a0af914f7e
+--- /dev/null
++++ b/third_party/blink/renderer/modules/minishell/mini_shell_manager.cc
+@@ -0,0 +1,132 @@
++// third_party/blink/renderer/modules/minishell/mini_shell_manager.cc
++
++#include "third_party/blink/renderer/modules/minishell/mini_shell_manager.h"
++
++#include "base/functional/bind.h"
++#include "third_party/blink/renderer/core/dom/dom_exception.h"
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
++
++namespace blink {
++
++MiniShellManager::MiniShellManager(ExecutionContext* context)
++    : fs_manager_remote_(context) {}
++
++mojom::cfs::blink::CodegateFSManager* MiniShellManager::GetFSManagerService(
++    ScriptState* script_state) {
++  if (!fs_manager_remote_.is_bound()) {
++    ExecutionContext::From(script_state)
++        ->GetBrowserInterfaceBroker()
++        .GetInterface(fs_manager_remote_.BindNewPipeAndPassReceiver(
++            ExecutionContext::From(script_state)
++                ->GetTaskRunner(TaskType::kInternalDefault)));
++  }
++  return fs_manager_remote_.get();
++}
++
++ScriptPromise<MiniShell> MiniShellManager::CreateShell(
++    ScriptState* script_state,
++    ExceptionState& exception_state) {
++  auto* resolver =
++      MakeGarbageCollected<ScriptPromiseResolver<MiniShell>>(script_state);
++  ScriptPromise<MiniShell> promise = resolver->Promise();
++
++  GetFSManagerService(script_state)
++      ->CreateFileSystem(WTF::BindOnce(&MiniShellManager::OnCreateFileSystem,
++                                       WrapPersistent(this),
++                                       WrapPersistent(resolver)));
++
++  return promise;
++}
++
++ScriptPromise<IDLBoolean> MiniShellManager::DeleteShell(
++    ScriptState* script_state,
++    uint32_t shell_id,
++    ExceptionState& exception_state) {
++  auto* resolver =
++      MakeGarbageCollected<ScriptPromiseResolver<IDLBoolean>>(script_state);
++  ScriptPromise<IDLBoolean> promise = resolver->Promise();
++
++  GetFSManagerService(script_state)
++      ->DeleteFileSystem(shell_id,
++                         WTF::BindOnce(&MiniShellManager::OnDeleteFileSystem,
++                                       WrapPersistent(this),
++                                       WrapPersistent(resolver), shell_id));
++
++  return promise;
++}
++
++ScriptPromise<MiniShell> MiniShellManager::get(
++    ScriptState* script_state,
++    uint32_t shell_id,
++    ExceptionState& exception_state) {
++  auto* resolver =
++      MakeGarbageCollected<ScriptPromiseResolver<MiniShell>>(script_state);
++  ScriptPromise<MiniShell> promise = resolver->Promise();
++
++  auto it = active_shells_.find(shell_id);
++
++  if (it != active_shells_.end()) {
++    resolver->Resolve(it->value);
++  } else {
++    GetFSManagerService(script_state)
++        ->GetFileSystemHandle(
++            shell_id,
++            WTF::BindOnce(
++                [](MiniShellManager* minishellmanager, uint32_t shell_id,
++                   ScriptPromiseResolver<MiniShell>* resolver, bool success,
++                   mojo::PendingRemote<mojom::cfs::blink::CodegateDirectory>
++                       new_dir_remote) {
++                  if (!success) {
++                    resolver->Reject(MakeGarbageCollected<DOMException>(
++                        DOMExceptionCode::kOperationError,
++                        "Failed to get file system handle."));
++                    return;
++                  }
++                  auto* new_shell = MakeGarbageCollected<MiniShell>(
++                      resolver->GetScriptState(), std::move(new_dir_remote),
++                      shell_id);
++                  minishellmanager->Add(shell_id, new_shell);
++                  resolver->Resolve(new_shell);
++                },
++                WrapPersistent(this), shell_id, WrapPersistent(resolver)));
++  }
++
++  return promise;
++}
++
++void MiniShellManager::OnCreateFileSystem(
++    ScriptPromiseResolver<MiniShell>* resolver,
++    uint32_t id,
++    mojo::PendingRemote<mojom::cfs::blink::CodegateDirectory> new_remote) {
++  auto* new_shell = MakeGarbageCollected<MiniShell>(resolver->GetScriptState(),
++                                                    std::move(new_remote), id);
++  Add(id, new_shell);
++  resolver->Resolve(new_shell);
++}
++
++void MiniShellManager::OnDeleteFileSystem(
++    ScriptPromiseResolver<IDLBoolean>* resolver,
++    uint32_t id,
++    bool success) {
++  if (!success) {
++    Sub(id);
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kOperationError, "Failed to delete file system."));
++    return;
++  } else {
++    resolver->Resolve(true);
++  }
++}
++
++void MiniShellManager::Add(uint32_t id, MiniShell* minishell) {
++  active_shells_.Set(id, minishell);
++}
++void MiniShellManager::Sub(uint32_t id) {
++  active_shells_.Take(id);
++}
++void MiniShellManager::Trace(Visitor* visitor) const {
++  visitor->Trace(fs_manager_remote_);
++  visitor->Trace(active_shells_);
++  ScriptWrappable::Trace(visitor);
++}
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/minishell/mini_shell_manager.h b/third_party/blink/renderer/modules/minishell/mini_shell_manager.h
+new file mode 100644
+index 0000000000000..68245277525a7
+--- /dev/null
++++ b/third_party/blink/renderer/modules/minishell/mini_shell_manager.h
+@@ -0,0 +1,68 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_MINISHELL_MINISHELL_MANAGER_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_MINISHELL_MINISHELL_MANAGER_H_
++
++// mojom
++#include "third_party/blink/public/mojom/cfs/cfs.mojom-blink.h"
++
++// blink dependency
++#include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/modules/minishell/mini_shell.h"
++#include "third_party/blink/renderer/modules/modules_export.h"
++#include "third_party/blink/renderer/platform/bindings/exception_state.h"
++#include "third_party/blink/renderer/platform/bindings/script_state.h"
++#include "third_party/blink/renderer/platform/bindings/script_wrappable.h"
++#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++#include "third_party/blink/renderer/platform/mojo/heap_mojo_remote.h"
++
++// Window Obj
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/platform/supplementable.h"
++
++namespace blink {
++
++class MODULES_EXPORT MiniShellManager final : public ScriptWrappable {
++  DEFINE_WRAPPERTYPEINFO();
++
++ public:
++  explicit MiniShellManager(ExecutionContext* context);
++
++  // IDL methods
++  // [CallWith=ScriptState, RaisesException] Promise<MiniShell> CreateShell();
++  ScriptPromise<MiniShell> CreateShell(ScriptState* script_state,
++                                       ExceptionState& exception_state);
++
++  // [CallWith=ScriptState, RaisesException] Promise<bool> DeleteShell();
++  ScriptPromise<IDLBoolean> DeleteShell(ScriptState* script_state,
++                                        uint32_t shell_id,
++                                        ExceptionState& exception_state);
++
++  // [CallWith=ScriptState, RaisesException] Promise<MiniShell> get(uint32_t
++  // id);
++  ScriptPromise<MiniShell> get(ScriptState* script_state,
++                               uint32_t shell_id,
++                               ExceptionState& exception_state);
++
++  // Callback
++  void OnCreateFileSystem(
++      ScriptPromiseResolver<MiniShell>* resolver,
++      uint32_t id, mojo::PendingRemote<mojom::cfs::blink::CodegateDirectory> new_remote);
++  void OnDeleteFileSystem(ScriptPromiseResolver<IDLBoolean>* resolver,
++                          uint32_t id,
++                          bool success);
++  void Add(uint32_t id, MiniShell* minishell);
++  void Sub(uint32_t id);
++  void Trace(Visitor* visitor) const override;
++
++ private:
++  mojom::cfs::blink::CodegateFSManager* GetFSManagerService(
++      ScriptState* script_state);
++
++  HeapMojoRemote<mojom::cfs::blink::CodegateFSManager> fs_manager_remote_;
++  HeapHashMap<uint32_t, Member<MiniShell>> active_shells_;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_MINISHELL_MINISHELL_MANAGER_H_
+diff --git a/third_party/blink/renderer/modules/minishell/mini_shell_manager.idl b/third_party/blink/renderer/modules/minishell/mini_shell_manager.idl
+new file mode 100644
+index 0000000000000..db32b43fb5dbc
+--- /dev/null
++++ b/third_party/blink/renderer/modules/minishell/mini_shell_manager.idl
+@@ -0,0 +1,11 @@
++interface MiniShellManager {
++    [CallWith=ScriptState, RaisesException] Promise<MiniShell> CreateShell();
++    [CallWith=ScriptState, RaisesException] Promise<boolean> DeleteShell(unsigned long id);
++    [CallWith=ScriptState, RaisesException] Promise<MiniShell> get(unsigned long id);
++};
++[
++    ImplementedAs=WindowMiniShellManager
++]
++partial interface Window {
++    [SameObject] readonly attribute MiniShellManager miniShellManager;
++};
+diff --git a/third_party/blink/renderer/modules/minishell/window_mini_shell_manager.cc b/third_party/blink/renderer/modules/minishell/window_mini_shell_manager.cc
+new file mode 100644
+index 0000000000000..dc20ae7269ba2
+--- /dev/null
++++ b/third_party/blink/renderer/modules/minishell/window_mini_shell_manager.cc
+@@ -0,0 +1,44 @@
++// third_party/blink/renderer/modules/minishell/minishell_manager.cc
++
++#include "third_party/blink/renderer/modules/minishell/window_mini_shell_manager.h"
++#include "third_party/blink/renderer/modules/minishell/mini_shell_manager.h"
++
++#include "base/functional/bind.h"
++#include "third_party/blink/renderer/core/dom/dom_exception.h"
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
++
++
++namespace blink {
++
++const char WindowMiniShellManager::kSupplementName[] = "WindowMiniShellManager";
++
++WindowMiniShellManager::WindowMiniShellManager(LocalDOMWindow& window)
++    : Supplement<LocalDOMWindow>(window) {}
++
++WindowMiniShellManager& WindowMiniShellManager::From(LocalDOMWindow& window) {
++  WindowMiniShellManager* supplement =
++      Supplement<LocalDOMWindow>::From<WindowMiniShellManager>(window);
++  if (!supplement) {
++    supplement = MakeGarbageCollected<WindowMiniShellManager>(window);
++    ProvideTo(window, supplement);
++  }
++  return *supplement;
++}
++
++MiniShellManager* WindowMiniShellManager::miniShellManager(LocalDOMWindow& window) {
++  return WindowMiniShellManager::From(window).miniShellManager(&window);
++}
++
++MiniShellManager* WindowMiniShellManager::miniShellManager(ExecutionContext* context) {
++  if(!mini_shell_manager_) {
++    mini_shell_manager_ = MakeGarbageCollected<MiniShellManager>(context);
++  }
++  return mini_shell_manager_.Get();
++}
++
++void WindowMiniShellManager::Trace(Visitor* visitor) const {
++  visitor->Trace(mini_shell_manager_);
++  Supplement<LocalDOMWindow>::Trace(visitor);
++
++}
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/minishell/window_mini_shell_manager.h b/third_party/blink/renderer/modules/minishell/window_mini_shell_manager.h
+new file mode 100644
+index 0000000000000..fa19443bca66d
+--- /dev/null
++++ b/third_party/blink/renderer/modules/minishell/window_mini_shell_manager.h
+@@ -0,0 +1,47 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_MINISHELL_WINDOW_MINISHELL_MANAGER_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_MINISHELL_WINDOW_MINISHELL_MANAGER_H_
++
++// mojom
++#include "third_party/blink/public/mojom/cfs/cfs.mojom-blink.h"
++
++// blink dependency
++#include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/modules/minishell/mini_shell.h"
++#include "third_party/blink/renderer/modules/modules_export.h"
++#include "third_party/blink/renderer/platform/bindings/exception_state.h"
++#include "third_party/blink/renderer/platform/bindings/script_state.h"
++#include "third_party/blink/renderer/platform/bindings/script_wrappable.h"
++#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++#include "third_party/blink/renderer/platform/mojo/heap_mojo_remote.h"
++
++// Window Obj
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/platform/supplementable.h"
++
++namespace blink {
++
++class MiniShellManager;
++class WindowMiniShellManager final
++    : public GarbageCollected<WindowMiniShellManager>,
++      public Supplement<LocalDOMWindow> {
++ public:
++  static const char kSupplementName[];
++
++  static WindowMiniShellManager& From(LocalDOMWindow& window);
++  static MiniShellManager* miniShellManager(LocalDOMWindow&);
++
++  explicit WindowMiniShellManager(LocalDOMWindow& window);
++
++  MiniShellManager* miniShellManager(ExecutionContext* context);
++
++  void Trace(Visitor* visitor) const override;
++
++ private:
++  Member<MiniShellManager> mini_shell_manager_;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_MINISHELL_WINDOW_MINISHELL_MANAGER_H_
+diff --git a/third_party/blink/renderer/platform/runtime_enabled_features.json5 b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+index 93c9798d3de30..080c6aa6bcc99 100644
+--- a/third_party/blink/renderer/platform/runtime_enabled_features.json5
++++ b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+@@ -214,6 +214,10 @@
+   },
+ 
+   data: [
++    {
++      name : "MiniShell",
++      status: "stable",
++    },
+     {
+       name: "Accelerated2dCanvas",
+       settable_from_internals: true,

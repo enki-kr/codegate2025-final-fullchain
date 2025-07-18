@@ -1,0 +1,11 @@
+interface MiniShellManager {
+    [CallWith=ScriptState, RaisesException] Promise<MiniShell> CreateShell();
+    [CallWith=ScriptState, RaisesException] Promise<boolean> DeleteShell(unsigned long id);
+    [CallWith=ScriptState, RaisesException] Promise<MiniShell> get(unsigned long id);
+};
+[
+    ImplementedAs=WindowMiniShellManager
+]
+partial interface Window {
+    [SameObject] readonly attribute MiniShellManager miniShellManager;
+};

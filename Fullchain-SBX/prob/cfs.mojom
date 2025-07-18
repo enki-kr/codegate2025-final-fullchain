@@ -1,0 +1,42 @@
+module blink.mojom.cfs;
+
+enum ITEMTYPE {
+    kFailed,
+    kFile,
+    kDir,
+};
+
+union CodegateItemResponse {
+  pending_remote<CodegateDirectory> remote_dir;
+  pending_remote<CodegateFile> remote_file;
+};
+
+interface CodegateFSManager {
+  CreateFileSystem() => (uint32 id, pending_remote<CodegateDirectory> remote_dir);
+  DeleteFileSystem(uint32 id) => (bool success);
+  GetFileSystemHandle(uint32 id) => (bool success, pending_remote<CodegateDirectory>? remote_dir);
+
+  /// You have a compromised renderer, right?
+  GetCode() => (uint64 addr);
+};
+
+interface CodegateDirectory {
+  GetItemHandle(string filename) => (ITEMTYPE type, CodegateItemResponse? remote_item);
+
+  CreateItem(string filename, ITEMTYPE type) => (ITEMTYPE type, CodegateItemResponse? remote_item);
+  DeleteItem(string filename) => (bool success);
+
+  RenameItem(string filename_orig, string filename_new) => (bool success);
+  ChangeItemLocation(string filename_src, string filename_dst) => (ITEMTYPE type, CodegateItemResponse? remote_item);
+
+  ListItems() => (array<string> data);
+  GetPwd() => (string data);
+};
+
+interface CodegateFile {
+  GetFilename() => (string filename);
+  Read() => (bool success, array<uint8>? data);
+  Write(array<uint8> data) => (bool success);
+  Edit(uint32 idx, uint8 value) => (bool success);
+  Close() => (bool success);
+};

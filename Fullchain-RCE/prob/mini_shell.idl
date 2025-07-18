@@ -1,0 +1,4 @@
+interface MiniShell {
+    [CallWith=ScriptState, RaisesException] long get_id();
+    [CallWith=ScriptState, RaisesException] Promise<DOMString> execute(DOMString command);
+};
